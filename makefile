@@ -1,27 +1,39 @@
-COMPILER=g++
-CFLAGS=-Wall -std=c++17 -Iheaders
+# === Compiler and flags ===
+COMPILER = g++
+CFLAGS = -Wall -std=c++17 -I$(HEADER_DIR)
 
+# === Project structure ===
 SRC_DIR = src
-COMPILED_DIR = build
 HEADER_DIR = headers
-TARGET_MAIN = $(COMPILED_DIR)/main
+BUILD_DIR = build
+TARGET = $(BUILD_DIR)/main
 
-all: $(TARGET_MAIN)
+# === Source and object files ===
+SRC_FILES := $(wildcard $(SRC_DIR)/*.cpp)
+OBJ_FILES := $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(SRC_FILES))
 
-$(TARGET_MAIN): $(COMPILED_DIR)/main.o $(COMPILED_DIR)/server.o 
+# === Default target ===
+all: $(TARGET)
+
+# === Link all objects into final executable ===
+$(TARGET): $(OBJ_FILES) | $(BUILD_DIR)
 	$(COMPILER) $(CFLAGS) -o $@ $^
 
-$(COMPILED_DIR)/main.o: $(SRC_DIR)/main.cpp $(HEADER_DIR)/server.h | $(COMPILED_DIR)
+# === Compile each .cpp into a .o ===
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
 	$(COMPILER) $(CFLAGS) -c $< -o $@
 
-$(COMPILED_DIR)/server.o: $(SRC_DIR)/server.cpp $(HEADER_DIR)/server.h | $(COMPILED_DIR)
-	$(COMPILER) $(CFLAGS) -c $< -o $@
+# === Ensure build directory exists ===
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
+# === Clean build artifacts ===
 clean:
-	rm -rf build
+	rm -rf $(BUILD_DIR)
 
-run: $(COMPILED_DIR)/main
-	./$(COMPILED_DIR)/main
+# === Run the program ===
+run: $(TARGET)
+	./$(TARGET)
 
-$(COMPILED_DIR):
-	mkdir -p $(COMPILED_DIR)
+clear-logs:
+	rm -f logs/*.log
