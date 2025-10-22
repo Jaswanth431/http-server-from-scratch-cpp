@@ -1,8 +1,7 @@
-#ifndef LOGGER_H
-#define LOGGER_H
+#pragma once
 #include<fstream>
 #include<string>
-using namespace std;
+
 
 enum LogLevel{
     DEBUG,
@@ -17,13 +16,11 @@ class Logger{
         LogLevel level;
     public:
         Logger();
-        Logger(string filename, LogLevel logLevel);
-        void log(const string &message,LogLevel currLevel);
-        void logInfo(const string &message);
-        void logError(const string &message);
-        void logWarn(const string &message);
-        void logDebug(const string &message);
+        Logger(std::string filename, LogLevel logLevel);
+        void log(const std::string &message,LogLevel currLevel);
+        void logInfo(const std::string &message);
+        void logError(const std::string &message);
+        void logWarn(const std::string &message);
+        void logDebug(const std::string &message);
         ~Logger();
 };
-
-#endif // LOGGER_H
