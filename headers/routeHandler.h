@@ -4,7 +4,7 @@
 #include<functional>
 
 using  handlerFunction = std::function<void(Request&, Response&)>;
-// using middelwareFunction = std::function<void(Request&, Response&, std::function<void()>)>;
+// using middlewareFunction = std::function<void(Request&, Response&, std::function<void()>)>;
 
 class RouteHandler{
     public:

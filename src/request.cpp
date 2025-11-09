@@ -39,6 +39,10 @@ void Request::parseHeaders(vector<string> headerLines){
         transform(key.begin(), key.end(), key.begin(), ::tolower);
         headers[key] = value;
     }
+
+    if (headers.find("host") == headers.end()) {
+        throw BadRequestException("Missing Host header");
+    }
 }
 
 // Parses the request line and fills method, path, and httpVersion
@@ -93,7 +97,9 @@ Request::Request(string headers, string requestBody){
         if(line.back() == '\r'){
             line.pop_back();
         }
-        lines.push_back(line);
+        if(!line.empty()){
+            lines.push_back(line);
+        }
     }
 
     if(lines.size() == 0){
@@ -103,5 +109,17 @@ Request::Request(string headers, string requestBody){
     parseRequestLine(lines[0]);
     parseHeaders(lines);
     parseQueryParams();
-    
+
+}
+
+//Clear all the request details so that we can reuse the same request to store the new request during a keep-alive connection. 
+void Request::clear(){
+    method.clear();
+    uri.clear();
+    path.clear();
+    httpVersion.clear();
+    body.clear();
+    headers.clear();
+    queryParams.clear();
+    params.clear();
 }

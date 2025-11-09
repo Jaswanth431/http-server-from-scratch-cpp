@@ -20,4 +20,6 @@ class Request{
         std::unordered_map<std::string, std::string> queryParams;
         std::unordered_map<std::string, std::string> params;
         Request(std::string headers, std::string body);
+        Request() = default;
+        void clear();
 };

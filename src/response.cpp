@@ -3,6 +3,8 @@
 #include<sys/socket.h>
 #include<logger.h>
 #include<unistd.h>
+#include<connection.h>
+#include<iostream>
 using namespace std;
 
 Response::Response(int socketFileDescr): socketFd(socketFileDescr){
@@ -11,9 +13,9 @@ Response::Response(int socketFileDescr): socketFd(socketFileDescr){
     statusMessage = "OK";
     body = "";
     //Default headers
-    setHeader("Connection", "close");
     setHeader("Server", "mini-nginx/1.0");
 }
+
 
 string Response::getMessageForStatusCode(int code){
     switch(code){
@@ -45,37 +47,32 @@ void Response::setHeader(const std::string &key, const std::string &value){
 }
 int Response::sendResponse(){
     //construction of response string
-    string response = httpVersion + " " + to_string(statusCode) + " " + statusMessage + "\r\n";
+    // Ensure mandatory headers are set BEFORE composing
+    if (!body.empty()) {
+        setHeader("Content-Length", std::to_string(body.size()));
+        setHeader("Content-Type", "text/plain");
+    } else {
+        setHeader("Content-Length", "0");
+    }
+
+    if(conn->isKeepAliveConnection()){
+        setHeader("Connection", "keep-alive");
+    }else{
+        setHeader("Connection", "close");
+    }
+
+    response = httpVersion + " " + to_string(statusCode) + " " + statusMessage + "\r\n";
     for(auto &headerPair: headers){
         response += headerPair.first + ": " + headerPair.second + "\r\n";   
     }
 
-    //End of headers
+    //End of headersconn.enableEpollin()
     response += "\r\n"; 
     if(!body.empty()){
         response += body;
     }
-    
-    //send response over socket
-    size_t totalBytesSent = 0;
-    size_t responseLength = response.length();
-    while(totalBytesSent < responseLength){
-        ssize_t bytesSent = send(socketFd, response.c_str() + totalBytesSent, responseLength - totalBytesSent, 0);
-        if(bytesSent == 0){
-            sendResponseStatus = 0;
-            return 0;
-        }else if(bytesSent < 0){
-            if(errno == EINTR){
-                //Interrupted by signal, try again
-                continue;
-            }
-            sendResponseStatus = -1;
-            return -1;
-        }else{
-            totalBytesSent += bytesSent;
-        }
-    }
-    sendResponseStatus=1;
+   
+    conn->responeIsReady();
     return 1;
 }
 void Response::setStatus(int code){
@@ -83,15 +80,20 @@ void Response::setStatus(int code){
     statusMessage = getMessageForStatusCode(code);
 }
 
-void Response::setBody(const std::string &bodyContent){
+void Response::setBody(const string &bodyContent){
     body = bodyContent;
-    if(!body.empty()){
-        setHeader("Content-Length", std::to_string(body.length()));
-        setHeader("content-type", "text/plain");
-    }
 }
 
 void Response::setMessage(const std::string &message){
     statusMessage = message;
 }
 
+void Response::clear(){
+    httpVersion = "HTTP/1.1";
+    statusCode = 200;
+    statusMessage = "OK";
+    body.clear();
+    response.clear();
+    headers.clear();
+    setHeader("Server", "mini-nginx/1.0");
+}

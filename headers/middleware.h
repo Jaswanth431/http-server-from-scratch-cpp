@@ -3,4 +3,4 @@
 #include<response.h>
 #include<functional>
 
-using middelwareFunction = std::function<void(Request&, Response&)>;
+using middlewareFunction = std::function<void(Request&, Response&)>;

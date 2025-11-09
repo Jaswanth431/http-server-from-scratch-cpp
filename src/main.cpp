@@ -16,14 +16,24 @@
 #include<routeHandler.h>
 #include<request.h>
 #include<response.h>
+#include<math.h>
 using namespace std;
 
-middelwareFunction sampleMiddlewareFunc = [](Request &req, Response &res)->void{
-    cout<<"Middleware function in action"<<endl;
-    cout<<"Do some preprocessing before actual handler will run"<<endl;
+// ─────────────────────────── Middleware Examples ───────────────────────────
+middlewareFunction authMiddleware = [](Request &req, Response &res) -> void {
+    // Simple mock check for ?token=123
+    if (req.queryParams.count("token") == 0 || req.queryParams["token"] != "123") {
+        res.setStatus(401);
+        res.setBody("Unauthorized\n");
+        res.sendResponse();
+    }
 };
 
-handlerFunction sampleHandlerFunc = [](Request &req, Response &res)->void{
+//Both middleware and handler functions will be able to access query params, dynamic path params and headers etc 
+//Everything is abstracted away
+//The user can simply focus on writing core logic
+middlewareFunction logMiddleware = [](Request &req, Response &res)->void{
+    cout << "[Middleware] " << req.method << " " << req.path << endl;
     cout<<"Printing the headers"<<endl;
     for(auto header: req.headers){
         cout<<"Header req["<<header.first<<"]"<<"="<<header.second<<endl;
@@ -41,46 +51,78 @@ handlerFunction sampleHandlerFunc = [](Request &req, Response &res)->void{
 
     cout<<"Printing the body of the request"<<endl;
     cout<<req.body<<endl;
+   
+};
 
-
-    //The use has access to all the required data in this handler, everything is abstracted away
-    //The user can simply focus on writing core logic
-
-
-    cout<<"Sending the response"<<endl;
+// ─────────────────────────── Route Handlers ───────────────────────────
+handlerFunction homeHandler = [](Request &req, Response &res) {
     res.setStatus(200);
-    res.setBody("Everything is working fine");
+    res.setBody("Welcome to root!\n");
     res.sendResponse();
 };
 
+handlerFunction echoHandler = [](Request &req, Response &res) {
+    // Example: dynamic params + query parsing
+    string user = req.params.count("user") ? req.params.at("user") : "unknown";
+    string q = req.queryParams.count("q") ? req.queryParams.at("q") : "";
+    string msg = "Hello, " + user + "! Query: " + q + "\n";
+    res.setStatus(200);
+    res.setBody(msg);
+    res.sendResponse();
+};
 
-int main(){
-    int port = 8888;
-    Server server;
+handlerFunction cpuHeavyHandler = [](Request &req, Response &res) {
+    double x = 0;
+    for (int i = 0; i < 1000000; ++i) x += std::sin(i);  // CPU busy loop
+    res.setStatus(200);
+    res.setBody("CPU work done\n");
+    res.sendResponse();
+};
 
-    // Register middleware here
-    server.use(sampleMiddlewareFunc);
-    
-    // Register the methods and handlers here
-    server.get("/test/:testId/what/:whatId", sampleHandlerFunc);
-    //server.POST("/submit", submitHandler);
-    //server.PUT("/update", updateHandler);
-    //server.DELETE("/delete", deleteHandler);
+handlerFunction ioHeavyHandler = [](Request &req, Response &res) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // Simulated DB/IO wait
+    res.setStatus(200);
+    res.setBody("IO operation complete\n");
+    res.sendResponse();
+};
 
-    // Start listening on the specified port
+handlerFunction jsonHandler = [](Request &req, Response &res) {
+    string body = R"({"status": "ok", "message": "JSON example"})";
+    res.setStatus(200);
+    res.setHeader("Content-Type", "application/json");
+    res.setBody(body);
+    res.sendResponse();
+};
+
+handlerFunction errorHandler = [](Request &req, Response &res) {
+    res.setStatus(500);
+    res.setBody("Something went wrong internally\n");
+    res.sendResponse();
+};
+
+// ─────────────────────────── Main ───────────────────────────
+int main() {
+    int port = 9000;
+    //Here threads in workerpool will get blocked on io, so need to have more threads so that some will be processing cpu bound tasks instead of all getting blocked. 
+    int threadPoolThreads = 512;
+
+    cout << "Starting HelixHTTP on port " << port
+         << " with " << threadPoolThreads << " worker threads..." << endl;
+
+    Server server(threadPoolThreads);
+
+    // Global middleware
+    server.use(logMiddleware);
+    // server.use(authMiddleware); // Uncomment to enforce token check globally
+
+    // Routes
+    server.get("/", homeHandler);
+    server.get("/cpu", cpuHeavyHandler);
+    server.get("/io", ioHeavyHandler);
+    server.get("/json", jsonHandler);
+    server.get("/user/:user", echoHandler);  // Example: dynamic param
+    server.get("/error", errorHandler);
+
     server.listen(port);
-    return 0;    
+    return 0;
 }
-
-
-//To do
-// 1. Do request parsing, create functions for handling different HTTP methods (GET, POST, etc.).
-// 2. Construct appropriate HTTP responses based on the requests.
-// 3. Implement concurrency to handle multiple client connections simultaneously.
-// 4. Handle params and query params in header file. 
-// 5. Add support to send static files (HTML, CSS, JS, images) from the server to the client.
-// 6. Implement routing mechanism to map URLs to specific handler functions.
-// 7. Persistent connections (Keep-Alive).
-// 8. Add a middleware system to process requests and responses.  
-
-

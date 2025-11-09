@@ -20,125 +20,341 @@
 #include <response.h>
 #include <sstream>
 #include <middleware.h>
-
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <threadpool.h>
+#include <timeoutManager.h>
 
 using namespace std;
-const int BACKLOG = 10; //How many pending connections queue will hold
+//How many pending connections queue will hold
+const int BACKLOG = 4096;
+//MAX_EPOLL_EVENTS specify the max number of events the epoll wait can return, if there are more, the epoll wait will return them in subsequenct calls
+const int MAX_EPOLL_EVENTS = 2048;
 extern vector<std::string> SUPPORTED_METHODS;
 
-Server::Server(): logger(LOG_FILE, DEBUG) {
+Server::Server(int threadCount): logger(LOG_FILE, ERROR), threadPool(threadCount), timeoutManager(TimeoutConfig()) {
+    requestHanlderFunction = [this](ClientConnection &conn){
+        //Once we got complete request, let a worker thread handle the request handling. 
+        try{
+            //parsing etc will happen
+            conn.req = Request(conn.requestHeaders, conn.requestBody);
+        }catch(exception &e){
+            //Send a bad request error
+            conn.res.setStatus(400);
+            conn.res.sendResponse();
+            return;
+        }
+
+        //Match the request to registered routes and do error handling if not found
+        handlerFunction routeHandler = getRouteHandlerForPath(conn.req);
+        //Invalid request route
+        if(!routeHandler){
+            // send 404 response
+            conn.res.setStatus(404);
+            conn.res.setBody("No handler found for route: " + conn.req.path);
+            conn.res.sendResponse();
+             return;
+        }
+
+        // Handle the middlewares here
+        for(auto middlewareFunc: middlewareFunctions){
+            try {
+                middlewareFunc(conn.req, conn.res);
+            } catch (std::exception& e) {
+                //send an error to the client
+                conn.res.setStatus(400);
+                conn.res.setBody("Error occured during the execution of middleware function" + std::string(e.what()));
+                conn.res.sendResponse();
+                return;
+            }
+        }
+
+        //Call the respective handler functions and handler will send the response back
+        try {
+            routeHandler(conn.req, conn.res);
+        }catch (std::exception& e) {
+            //Handle exception while handler function. 
+            conn.res.setStatus(500);
+            conn.res.setBody("Function threw exception: " + std::string(e.what()));
+            conn.res.sendResponse();
+        }
+    };
 }
 
-void Server::listenRequests(int serverSocketFd){
-
-    while(true){
+int Server::acceptClientConnections(int serverSocketFd, int epollFd){
         struct sockaddr_storage clientAddr;
         socklen_t clientAddrLen = sizeof(clientAddr);
         int clientSoc = accept(serverSocketFd, (struct sockaddr *)&clientAddr, &clientAddrLen);
         if(clientSoc == -1){
-            continue;
+            logger.logError("Unable to create a client socket" + string(strerror(errno)));
+            return -1;
         }
+        //Make the client socket non blocking as well. This will make the recv and send non blocking. 
+        int flags = fcntl(clientSoc, F_GETFL);
+        fcntl(clientSoc, F_SETFL, flags | O_NONBLOCK);
 
-        //Handle new client connection
+        //Print the client IP
         struct sockaddr *clientAddrPtr = (struct sockaddr *)&clientAddr;
         int addressLen = clientAddrPtr->sa_family== AF_INET? INET_ADDRSTRLEN : INET6_ADDRSTRLEN;
         char ip[addressLen];
         getIpStr(clientAddrPtr, ip, addressLen);
         logger.logInfo("Accepted new connection from " + string(ip));
 
-
-        //Start here to listen and respond to client requests
-        //1. Use recv to get data from client
-        string requestHeaders;
-        string requestBody;
-        int recvStatus = receiveHttpRequest(clientSoc, requestHeaders, requestBody);
-        if(recvStatus <= 0){
-            logger.logWarn("Failed to receive complete HTTP request from " + string(ip));
-            //send a bad request response
-            close(clientSoc);
-            continue;
-        }
-        logger.logDebug("Received HTTP request headers:\n" + requestHeaders);
-        logger.logDebug("Received HTTP request body:\n" + requestBody);
-
-        //2. Parse the request and generate request object
-        Request request(requestHeaders, requestBody);
-        Response response(clientSoc);
-        // logger.logInfo("Parsed HTTP request: " + request.method + " " + request.uri + " " + request.httpVersion);
-        // for(auto p: request.queryParams){
-        //     logger.logDebug("Key: " + p.first + " Value: " + p.second);
-        // }
-
-        // for(auto p: request.headers){
-        //     logger.logDebug("Key: " + p.first + " Value: " + p.second);
-        // }
-
-        //3. Handle the middlewares here
-        for(auto middlewareFunc: middelwareFunctions){
-            middlewareFunc(request, response);
-        }
-
-        //4. Match the request to registered routes and do error handling if not found
-        handlerFunction routeHandler = getRouteHandlerForPath(request);
-        //Invalid request route
-        if(!routeHandler){
-            logger.logWarn("No handler found for route: " + request.path);
-            //send 404 response
-            
-            response.setStatus(404);
-            int sendStatus = response.sendResponse();
-            if(sendStatus == 0){
-                logger.logWarn("Failed to send response to client as client closed the connection" + string(ip));
-            }else if(sendStatus < 0){
-                logger.logError("Failed to send response to client " + string(ip));
-            }
-            close(clientSoc);
-            continue;
-        }
-
-
-        //5. Call the respective handler functions and handler will send the response back
-        routeHandler(request, response);
-
-        if(response.sendResponseStatus == 0){
-            logger.logWarn("Client closed the connection. IP: " + string(ip));
-            close(clientSoc);
-        }else if(response.sendResponseStatus == -1){
-            logger.logWarn("Failed to send data to IP: " + string(ip));
-            close(clientSoc);
-        }
-        logger.logInfo("Sent response to client " + string(ip));
-
-        //6. Close the client socket based on the Connection header
-        close(clientSoc);
-    }
-    
+        return clientSoc;
 }
 
-int Server::receiveHttpRequest(int clientSocketFd, string &requestHeaders,string &requestBody){
-    string &headerBuffer = requestHeaders;
-    string &bodyBuffer = requestBody;
-    char tempBuffer[4096];
-    bool headerReceived = false;
-    size_t contentLength = 0;
-    size_t totalBodyBytesReceived = 0;
+void Server:: listenRequests(int serverSocketFd){
+    //create a epollInstance, pass any value greater than 0, that will be ignored anyway.
+    int epollFd = epoll_create(1);
+    if(epollFd  == -1){
+        logger.logError("Unable to create a epoll instance: " + string(strerror(errno)));
+        exit(1);
+    }
+
+    //add the serversocket to epoll to get read events which is nothing but a new connection request
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = serverSocketFd;
+
+    int epollAddStatus = epoll_ctl(epollFd, EPOLL_CTL_ADD, serverSocketFd, &ev);
+    if(epollAddStatus == -1){
+        logger.logError("Unable to add server socket to epoll instance: " + string(strerror(errno)));
+        exit(1);
+    }
+
+    struct epoll_event events[MAX_EPOLL_EVENTS];
+    //This is the reactor, it reacts to different events that happens during the life cycle of a socekt connetion of different sockets
     while(true){
+        //now we are ready to get the events. If the event is for server socket, that is a new connections, we will accept. If the event is for client sockets, the based on read or write, we perform corresponsing action on that socket. 
+        int timeoutInMs = 2500;        
+        int eventCount = epoll_wait(epollFd, events, MAX_EPOLL_EVENTS, timeoutInMs);
+        if(eventCount < 0 ){
+            //eventCount = -1;
+            if(errno==EINTR){
+                //interruped by a signal handler
+                continue;
+            }else{
+                logger.logError("Error occured during epoll_wait: " + string(strerror(errno)));
+                exit(1);
+            }
+        }
+
+        handleTimeouts();
+        if(eventCount == 0){
+            //timer timeout occured
+            continue;
+        }
+
+        //when eventCount > 0, the there are events and we need to process them
+        for(int i=0; i<eventCount; i++){
+            int eventFd = events[i].data.fd;
+            if(eventFd == serverSocketFd){
+                //accept the connections here
+                //continiously accetp when many are available to connect. 
+                while (true) {
+                    int clientSocFd = acceptClientConnections(serverSocketFd, epollFd);
+                    if (clientSocFd == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            break; // all accepted
+                        logger.logError("Error accepting new connection: " + string(strerror(errno)));
+                        break;
+                    }
+                    logger.logInfo("Newly created client socket " + to_string(clientSocFd));
+                    auto& connRef = connectionMap.try_emplace(clientSocFd, clientSocFd, epollFd).first->second;
+                    if (connRef.addFdAndEnableEpollin() == -1) {
+                        logger.logError("Unable to add client socket to epoll: " + string(strerror(errno)) + " "+ to_string(clientSocFd));
+                        closeConnection(connRef);
+                    }
+                    
+                }
+                continue;
+            }else{
+                //process read or write request for the client sockets
+                //Get the connection object
+                ClientConnection &conn = connectionMap[eventFd];
+                if(events[i].events & (EPOLLERR | EPOLLHUP)){
+                    closeConnection(conn);
+                    continue;
+                }
+                if(events[i].events & EPOLLIN){
+                    //recv the data from the client
+                    if(conn.state == ConnState::REQUEST_RESET){
+                        conn.state  = ConnState::READING_REQUEST;
+                        conn.lastActivity = Clock::now();
+                        conn.timerVersion++;
+                        timeoutManager.refresh(conn.clientSocketFd, conn.timerVersion, TimeoutType::READ);
+                    }
+                    int recvStatus = receiveHttpRequest(conn);
+                    if(recvStatus <= 0){
+                        if(recvStatus == -2){
+                            //Send a bad request error
+                            conn.res.setStatus(400);
+                            conn.res.sendResponse();
+                        }else{
+                            //received some error during receive
+                            closeConnection(conn);
+                        }
+                    }else{
+                        //We reacieved complete request, so process it. 
+                        if(conn.isRequestReadingDone){
+                            struct epoll_event newEvent = events[i];
+                            newEvent.events = EPOLLET;
+                            int status = conn.setEventForEpollEvent(newEvent);
+                            if(status == -1){
+                                logger.logError("Unable to remove the the ready to read event(EPOLLIN)");
+                                closeConnection(conn);
+                                continue;
+                            }
+                            logger.logDebug("Request headers\n");
+                            for(auto pr: conn.req.headers){
+                                 logger.logDebug(pr.first + ": " + pr.second);
+                            }
+                           
+                            //add task to the task handler, the worker thread will process the request and sends the response back to client'
+                            conn.state = ConnState::PROCESSING;
+                            conn.processingStart = Clock::now();
+                            conn.timerVersion++;
+                            timeoutManager.refresh(conn.clientSocketFd, conn.timerVersion, TimeoutType::PROCESSING);
+                            threadPool.addTask(conn, requestHanlderFunction);
+                        }
+                    }
+                }else if(events[i].events & EPOLLOUT){
+                    //send the data to the client
+                    int sendStatus = sendHttpResponse(conn);
+                    if(conn.state == ConnState::PROCESSING){
+                        conn.state = ConnState::WRITING_RESPONSE;
+                        conn.lastActivity = Clock::now();
+                        conn.timerVersion++;
+                        timeoutManager.refresh(conn.clientSocketFd, conn.timerVersion, TimeoutType::WRITE);
+                    }
+                    if(sendStatus == -1 || sendStatus == -2){
+                        //close the socket as we got some error during sending data. 
+                        //handle closing. 
+                        closeConnection(conn);
+                    }else{
+                        //If send some part or completly with out errors. 
+                        //If complete response is sent
+                        if(conn.isResponseSendingDone){
+                            //handle the closing or keep live thing here.
+                            if(conn.isKeepAliveConnection()){
+                                conn.state = ConnState::KEEP_ALIVE_WAIT;
+                                conn.lastActivity = Clock::now();
+                                conn.timerVersion++;
+                                timeoutManager.refresh(conn.clientSocketFd, conn.timerVersion, TimeoutType::IDLE);
+                                logger.logInfo("Keeping the connection live");
+                                conn.clearCurrentRequest();
+                                conn.enableEpollin();
+                            }else{
+                                closeConnection(conn);
+                            }
+                        }else{
+                            //still need to send some more data, when space is available to send in buffers, will try again. 
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         
+    }
+}
+
+void Server::handleTimeouts(){
+    // Periodically check for expired timers
+        auto expiredEntries = timeoutManager.collectExpired();
+        for (auto &entry : expiredEntries) {
+            auto it = connectionMap.find(entry.fd);
+            if (it == connectionMap.end()) continue;
+            auto &conn = it->second;
+
+            // Skip stale timers (version mismatch)
+            if (conn.timerVersion != entry.version) continue;
+
+            // Handle timeout by type
+            cout<<"connection timedout"<<endl;
+            switch (entry.type) {
+                case TimeoutType::READ:
+                    logger.logInfo("Connection timed out (Request timeout), socked fd: " + to_string(entry.fd));
+                    break;
+                case TimeoutType::WRITE:
+                    logger.logInfo("Connection timed out (Response timeout), socked fd: " + to_string(entry.fd));
+                    break;
+                case TimeoutType::PROCESSING:
+                    logger.logInfo("Connection timed out, (Too longer to process), socked fd: " + to_string(entry.fd));
+                    break;
+                case TimeoutType::IDLE:
+                    logger.logInfo("Connection timed out (No activity found), socked fd: " + to_string(entry.fd));
+                    break;
+            }
+            closeConnection(conn);
+        }
+}
+
+void Server::closeConnection(ClientConnection &conn){
+    int clientFd = conn.clientSocketFd;
+    conn.deleteFdFromEpoll();
+    connectionMap.erase(clientFd);
+    close(clientFd);
+    logger.logInfo("Connection closed successfully");
+}
+
+int Server::sendHttpResponse(ClientConnection &conn){
+    while(conn.currentlySentBytes< conn.totalResponseLength){
+        ssize_t bytesSent = send(conn.clientSocketFd, conn.responsePtr + conn.currentlySentBytes, conn.totalResponseLength - conn.currentlySentBytes, 0);
+        if(bytesSent == -1){
+            //interupped, just try again. 
+            if(errno == EINTR){
+                continue;
+            }else if(errno == EAGAIN || errno == EWOULDBLOCK){
+                //we are able to send all the data we could, we will try again when some space is avaialbe.
+                return 1;
+            }else if(errno == EPIPE || errno == ECONNRESET){
+                //client closed the connection. 
+                logger.logWarn("Connection closed by the client");
+                return -2;
+            }else{
+                //some other error occured. 
+                logger.logError("Some error occured while sending data to client:" + string(strerror(errno)));
+                return -1;
+            }
+        }else{
+            conn.currentlySentBytes = conn.currentlySentBytes + bytesSent;
+        }
+    }
+
+    conn.isResponseSendingDone = true;
+    return 1;
+}
+
+int Server::receiveHttpRequest(ClientConnection &conn){
+    string &headerBuffer = conn.requestHeaders;
+    string &bodyBuffer = conn.requestBody;
+    int clientSocketFd = conn.clientSocketFd;
+    char tempBuffer[4096];
+    bool &headerReceived = conn.headerReceived;
+    size_t &contentLength = conn.contentLength;
+    size_t &totalBodyBytesReceived = conn.totalBodyBytesReceived;
+    while(true){
         int bytesReceived = recv(clientSocketFd, tempBuffer, sizeof(tempBuffer) , 0);
         //Connection closed or error
         if(bytesReceived == 0){
             //0 indicating connection closed
             //only executes when headers are not yet received completely or body not fully received
             logger.logWarn("Connection closed before complete request was received");
-            return -1;
+            return 0;
         }else if(bytesReceived < 0){
             //-1 indicating error
             if(errno == EINTR){
                 //Interrupted by signal, try again
                 continue;
+            }else if(errno == EAGAIN || errno == EWOULDBLOCK){
+                //all the available data is completed, so return now
+                return 1;
+            }else{
+                logger.logError("Receive error: " + string(strerror(errno)));
+                return -1;
             }
-            logger.logError("Receive error: " + string(strerror(errno)));
-            return -1;
         }else{
             if(!headerReceived){
                 headerBuffer.append(tempBuffer, bytesReceived);
@@ -172,6 +388,7 @@ int Server::receiveHttpRequest(int clientSocketFd, string &requestHeaders,string
                             if(contentLength <= 0){
                                 //No body to receive
                                 bodyBuffer = "";
+                                conn.isRequestReadingDone = true;
                                 return 1;
                             }
                         }catch(exception& e){
@@ -181,6 +398,7 @@ int Server::receiveHttpRequest(int clientSocketFd, string &requestHeaders,string
                     }else{
                         // Content-Length header not found, assuming no body
                         bodyBuffer = "";
+                        conn.isRequestReadingDone = true;
                         return 1;
                     }
 
@@ -191,37 +409,38 @@ int Server::receiveHttpRequest(int clientSocketFd, string &requestHeaders,string
                         totalBodyBytesReceived = bodyBuffer.length();
                     }
                     // Keep only headers in headerBuffer. Remove last \r\n\r\n
-                    headerBuffer.erase(headerEndPos); 
+                    headerBuffer.erase(bodyStartPos); 
 
                 }
             }else{
                 bodyBuffer.append(tempBuffer, bytesReceived);
                 totalBodyBytesReceived += bytesReceived;
             }
+            //check whether we received complete body
             if(totalBodyBytesReceived == contentLength){
+                conn.isRequestReadingDone = true;
                 return 1;
             }else if(totalBodyBytesReceived > contentLength){
                 //Received more than expected
                 //Bad request
                 return -2;
             }
+
+             //handle size limits. Saves from DoS attacks
+            if (headerBuffer.size() > 8192) {
+                logger.logWarn("Header too large");
+                return -2;
+            }
+
+            //For now we only allow body size < ~10MB
+            if (contentLength > 10000000) {
+                logger.logWarn("Body too large");
+                return -2;
+            }
+
             continue; 
-
         }
-
-        //handle size limits. Saves from DoS attacks
-        if (headerBuffer.size() > 8192) {
-            logger.logWarn("Header too large");
-            return -2;
-        }
-
-        if (contentLength > 1000000) {
-            logger.logWarn("Body too large");
-            return -2;
-        }
-
     }
-
    
 }
 
@@ -267,8 +486,11 @@ int Server::createServerSocket(int port){
     int serverSoc = -1;
     for(struct addrinfo *p = addressList; p!=NULL; p = p->ai_next){
         //Creating server side socket
-        if(serverSoc = socket(p->ai_family, p->ai_socktype, p->ai_protocol); serverSoc == -1){
-            logger.logDebug("Socket error: " + string(strerror(errno)));
+        //Make this socket a non blocking socket
+        //In general, accept() call is blocking meaning, when you call accept and there no client connection available, the thread will get blocked until a client initiates a new connection. 
+        //when you make a socket non blocking, then if you make call to accept(), it will accept if a new connection if that exists and return -1 and errno to EAGAIN or EWOULDBLOCK  indicating no active connection request are present, but it will not block, so you can go and do some other task instead of getting blocked like sending or receiving data for some other sockets. 
+        if(serverSoc = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol); serverSoc == -1){
+            logger.logError("Socket error: " + string(strerror(errno)));
             continue;
         }
         int val = 1;
@@ -296,13 +518,13 @@ int Server::createServerSocket(int port){
     return serverSoc;
 }
 
-void Server::use(middelwareFunction func){
-    middelwareFunctions.push_back(func);
+void Server::use(middlewareFunction func){
+    middlewareFunctions.push_back(func);
 }
 
 void Server::route(const string &method, const string &path, handlerFunction &handler){
     if(find(SUPPORTED_METHODS.begin(), SUPPORTED_METHODS.end(), method) == SUPPORTED_METHODS.end()){
-        logger.logError("Attempted to register unsupported HTTP method: " + method);
+        logger.logWarn("Attempted to register unsupported HTTP method: " + method);
         throw NotSupportedException("HTTP Method " + method + " is not supported");
     }
     
